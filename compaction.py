@@ -9,6 +9,16 @@ What’s new:
 - DOCX: Insert "Regression Equation" (equation + narrative) just before "Conclusion" (Admins only)
 """
 
+import streamlit as st, traceback
+
+def safe_run(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        st.error("A section failed while rendering.")
+        st.code("".join(traceback.format_exc()))
+        st.stop()
+
 import os, io, json, textwrap, base64, tempfile
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
