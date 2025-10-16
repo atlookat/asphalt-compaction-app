@@ -2,24 +2,14 @@
 """
 Asphalt Compaction: Air Void Prediction Studio
 
-What’s new:
-- XLSX: Viridis-like Correlation_Heatmap_Color with vertical colorbar (+1 → -1)
-- DOCX: remove duplicate heatmap; add Drivers vs Target, Diagnostics, Probability, Learning Curve,
-        QQ Plot, Leverage vs Std Residuals, Cook’s Distance, Temperature-only Curve (with narratives)
-- DOCX: Insert "Regression Equation" (equation + narrative) just before "Conclusion" (Admins only)
+Updates for Streamlit Cloud stability:
+- Performance mode toggle, optional diagnostics, SHAP sampling, and guarded heavy sections
+- Clear Matplotlib figures and trigger garbage collection after renders
+- Use Matplotlib 'Agg' backend to avoid GUI backends
+- Exports computed only when requested via a button
 """
 
-import streamlit as st, traceback
-
-def safe_run(fn, *args, **kwargs):
-    try:
-        return fn(*args, **kwargs)
-    except Exception as e:
-        st.error("A section failed while rendering.")
-        st.code("".join(traceback.format_exc()))
-        st.stop()
-
-import os, io, json, textwrap, base64, tempfile
+import os, io, json, textwrap, base64, tempfile, gc, traceback
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 
@@ -39,7 +29,12 @@ from statsmodels.stats.outliers_influence import variance_inflation_factor
 import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
+
+# Use a headless backend for Matplotlib
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
 import scipy.stats as stats
 from scipy.stats import f as f_dist
 
@@ -62,6 +57,23 @@ from reportlab.lib.utils import ImageReader
 from docx import Document
 from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+# -----------------------
+# Small utilities
+# -----------------------
+def safe_run(fn, *args, **kwargs):
+    """Run a callable and surface full traceback in the UI if it fails."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception:
+        st.error("A section failed while rendering.")
+        st.code("".join(traceback.format_exc()))
+        st.stop()
+
+def clear_figs():
+    """Close Matplotlib figures and trigger garbage collection."""
+    plt.close("all")
+    gc.collect()
 
 # ========= Regression Equation Helpers =========
 def _get_pipeline_parts(pipeline: Pipeline):
@@ -93,12 +105,6 @@ def build_equation_string(
     base_feature_names: List[str],
     target_name: str = "y"
 ) -> Tuple[str, str]:
-    """
-    Returns (equation_string, equation_notes).
-
-    - Linear + StandardScaler (no PolynomialFeatures): back-transform to original feature scale.
-    - With PolynomialFeatures (± StandardScaler): show equation in model-input space and label clearly.
-    """
     poly, scaler, model = _get_pipeline_parts(pipeline)
     coefs, intercept = _coefs_intercept(model)
     feat_names = _poly_feature_names(poly, base_feature_names)
@@ -129,19 +135,16 @@ def build_equation_string(
                     if t: terms.append(t)
                 return "".join(terms), "Equation shown in STANDARDIZED space (scaler stats unavailable)."
 
-    # Case B: PolynomialFeatures present → report in model-input space
+    # Case B: PolynomialFeatures present
     terms = [f"{target_name} (model input space) = {intercept:.4g}"]
     for n, b in zip(feat_names, coefs):
         t = _format_term(n, b)
         if t: terms.append(t)
 
     if scaler is None:
-        notes = "Equation shown in POLYNOMIAL feature space (no scaler). " \
-                "Terms like X1^2 and X1:X2 are squared/interaction features."
+        notes = "Equation shown in POLYNOMIAL feature space (no scaler)."
     else:
-        notes = "Equation shown in POLYNOMIAL + STANDARDIZED feature space. " \
-                "Exact back-transformation of all cross-terms is non-trivial; " \
-                "coefficients apply to the model’s transformed inputs."
+        notes = "Equation shown in POLYNOMIAL + STANDARDIZED feature space. Coefficients apply to the model’s transformed inputs."
     return "".join(terms), notes
 
 def build_equation_narrative(
@@ -151,25 +154,19 @@ def build_equation_narrative(
     target_name: str,
     key_insights: Optional[List[str]] = None
 ) -> str:
-    """
-    Asphalt compaction–specific narrative to accompany the regression equation.
-    (Kept compact because long-form 1500-char commentaries exist elsewhere.)
-    """
     bullets = key_insights or []
     parts = []
     parts.append(
         f"The regression expression models {target_name} as a weighted combination of field QC factors. "
-        f"Overall fit is R²={r2:.3f}, RMSE={rmse:.3f}, MAE={mae:.3f}, indicating typical on-section error "
-        f"magnitudes consistent with practical tolerance envelopes for in-place density."
+        f"Overall fit is R²={r2:.3f}, RMSE={rmse:.3f}, MAE={mae:.3f}, indicating typical on-section error magnitudes."
     )
     if bullets:
         parts.append("Coefficient-level observations:")
         for b in bullets:
             parts.append(f"• {b}")
     parts.append(
-        "Positive coefficients imply increases in predicted air voids as that factor increases, all else equal; "
-        "negative coefficients imply improved densification. These signs and magnitudes help calibrate roller pass counts, "
-        "paver speed, and temperature windows to keep density in-spec while avoiding over-compaction."
+        "Positive coefficients imply increases in predicted air voids as that factor increases; "
+        "negative coefficients imply improved densification."
     )
     return "\n\n".join(parts)
 
@@ -188,13 +185,13 @@ SUN_ICON_PATH = os.getenv("SUN_ICON_PATH", "assets/sun.png")
 MOON_ICON_PATH = os.getenv("MOON_ICON_PATH", "assets/moon.png")
 
 # Export constants
-APP_VERSION = "v1.0.0"
+APP_VERSION = "v1.1.0"
 TS = lambda: datetime.now().strftime("%Y%m%d-%H%M%S")
 DOC_FILENAME = lambda: f"Asphalt_Compaction_Report_{APP_VERSION}_{TS()}.docx"
 PDF_FILENAME = lambda: f"Asphalt_Compaction_Report_{APP_VERSION}_{TS()}.pdf"
 XLSX_FILENAME = lambda: f"Asphalt_Compaction_Report_{APP_VERSION}_{TS()}.xlsx"
 
-# GitHub palette
+# GitHub-like palette
 GITHUB_THEME = {
     "light": {
         "bg": "#ffffff", "panel": "#f6f8fa", "text": "#1f2328", "muted": "#57606a",
@@ -206,10 +203,8 @@ GITHUB_THEME = {
     }
 }
 
-# Chart export color for non-heatmap charts in DOCX/PDF
 DOCX_COLOR = "#4F81BD"
 
-# Bibliography seed for citations
 BIB_SEED = [
   {"authors":"TRB/NCHRP", "title":"Intelligent Construction Technologies and Asphalt Compaction", "year":"2019", "publisher":"Transportation Research Board"},
   {"authors":"Roberts, F.L. et al.", "title":"Hot Mix Asphalt Materials, Mixture Design and Construction", "year":"2009", "publisher":"NAPA"},
@@ -218,7 +213,7 @@ BIB_SEED = [
 ]
 
 # -----------------------
-# Page config (favicon)
+# Page config
 # -----------------------
 def _load_favicon() -> Optional[str]:
     if FAVICON_PATH and os.path.exists(FAVICON_PATH):
@@ -244,49 +239,11 @@ def require_admin() -> bool:
     return get_user_role() == "admin"
 
 # ------------------------
-# Theme / Icons (PNG first, SVG fallback) — no base64, no broken <img>
+# Theme / Icons
 # ------------------------
 from pathlib import Path
-import os
-import streamlit as st
-
 APP_DIR = Path(__file__).parent.resolve()
 ASSET_DIR = APP_DIR / "assets"
-
-def _first_existing(*candidates: Path) -> Path | None:
-    for p in candidates:
-        if p and p.exists():
-            return p
-    return None
-
-SUN_PATH  = _first_existing(ASSET_DIR / "sun.png",  ASSET_DIR / "sun.svg")
-MOON_PATH = _first_existing(ASSET_DIR / "moon.png", ASSET_DIR / "moon.svg")
-
-def theme_toggle_icons():
-    cols = st.columns([7, 1.4, 1.4, 3])
-
-    st.markdown("""
-    <style>
-      div.stButton > button { padding:6px 10px; min-width:44px; border-radius:10px; }
-      .icon-wrap { text-align:center; margin-top:4px; height:26px; }
-    </style>
-    """, unsafe_allow_html=True)
-
-    # --- Light mode ---
-    with cols[1]:
-        if st.button("🔆", key="light_btn"):
-            st.session_state["theme"] = "light"
-            st.markdown("<script>localStorage.setItem('ac_theme','light');</script>", unsafe_allow_html=True)
-            st.rerun()
-        # st.image(str(SUN_PATH), width=24)  ← commented out
-
-    # --- Dark mode ---
-    with cols[2]:
-        if st.button("🌙", key="dark_btn"):
-            st.session_state["theme"] = "dark"
-            st.markdown("<script>localStorage.setItem('ac_theme','dark');</script>", unsafe_allow_html=True)
-            st.rerun()
-        # st.image(str(MOON_PATH), width=24) ← commented out
 
 def inject_github_theme():
     if "theme" not in st.session_state:
@@ -306,16 +263,18 @@ def inject_github_theme():
         background: var(--panel); border:1px solid var(--border);
         border-radius:.5rem; padding:1rem;
       }}
-      .icon-img {{ vertical-align: middle; width:24px; height:24px; }}
     </style>
-    <script>
-      const saved = localStorage.getItem('ac_theme');
-      if (saved) {{
-        window.parent.document.documentElement.dataset.acTheme = saved;
-      }}
-    </script>
     """
     st.markdown(css, unsafe_allow_html=True)
+
+def theme_toggle_icons():
+    cols = st.columns([7, 1.4, 1.4, 3])
+    with cols[1]:
+        if st.button("🔆", key="light_btn"):
+            st.session_state["theme"] = "light"; st.rerun()
+    with cols[2]:
+        if st.button("🌙", key="dark_btn"):
+            st.session_state["theme"] = "dark"; st.rerun()
 
 # -----------------------
 # Data / Modeling utils
@@ -443,61 +402,6 @@ def _excel_regression_blocks(ols_res) -> tuple[dict, pd.DataFrame, pd.DataFrame]
     })
     return reg_stats, anova_df, coef_df
 
-def _write_excel_regression_summary(ws, reg_stats: dict, anova_df: pd.DataFrame, coef_df: pd.DataFrame):
-    from openpyxl.styles import Font, Alignment, Border, Side
-    bold = Font(bold=True)
-    center = Alignment(horizontal="center")
-    thin = Border(left=Side(style="thin"), right=Side(style="thin"),
-                  top=Side(style="thin"), bottom=Side(style="thin"))
-
-    ws["A1"].value = "Regression Statistics"
-    ws["A1"].font = bold
-
-    labels = ["Multiple R","R Square","Adjusted R Square","Standard Error","Observations"]
-    r = 2
-    for lab in labels:
-        ws.cell(row=r, column=1, value=lab).font = bold
-        ws.cell(row=r, column=2, value=reg_stats.get(lab))
-        r += 1
-
-    ws["A8"].value = "ANOVA"; ws["A8"].font = bold
-    headers = ["df","SS","MS","F","Significance F"]
-    for j,h in enumerate([""]+headers, start=1):
-        ws.cell(row=9, column=j, value=h).font = bold
-        ws.cell(row=9, column=j).alignment = center
-
-    for i,row in enumerate(anova_df.itertuples(index=False), start=10):
-        ws.cell(row=i, column=1, value=row.Source)
-        ws.cell(row=i, column=2, value=row.df)
-        ws.cell(row=i, column=3, value=row.SS)
-        ws.cell(row=i, column=4, value=row.MS)
-        ws.cell(row=i, column=5, value=row.F)
-        ws.cell(row=i, column=6, value=row._5)
-
-    for i in range(9, 9+1+len(anova_df)):
-        for j in range(1, 6+1):
-            ws.cell(row=i, column=j).border = thin
-
-    base = 14
-    ws.cell(row=base, column=1, value="Coefficients").font = bold
-    coef_headers = ["Variable","Coefficients","Standard Error","t Stat","P-value","Lower 95%","Upper 95%"]
-    for j,h in enumerate(coef_headers, start=1):
-        ws.cell(row=base+1, column=j, value=h).font = bold
-        ws.cell(row=base+1, column=j).alignment = center
-    for i,row in enumerate(coef_df.itertuples(index=False), start=base+2):
-        for j,val in enumerate(row, start=1):
-            ws.cell(row=i, column=j, value=val)
-
-    rows = coef_df.shape[0] + 1
-    cols = len(coef_headers)
-    for i in range(base+1, base+1+rows+0):
-        for j in range(1, cols+1):
-            ws.cell(row=i, column=j).border = thin
-
-    ws.column_dimensions["A"].width = 24
-    for col in ["B","C","D","E","F","G"]:
-        ws.column_dimensions[col].width = 16
-
 # -----------------------
 # Narratives & citations
 # -----------------------
@@ -509,13 +413,12 @@ def citations_for(section: str) -> str:
     return f"{fmt(c1)} {fmt(c2)}"
 
 def generate_commentary(section: str, df: pd.DataFrame, metrics: Optional[dict]=None, target: Optional[str]=None) -> str:
-    base = f"{section} — This section analyzes statistical structure and asphalt compaction relevance. "
+    base = f"{section} – statistical structure and asphalt compaction relevance. "
     if metrics:
-        base += f"Model performance yields R²={metrics.get('R2',0):.3f} and RMSE={metrics.get('RMSE',0):.3f}, gauging adequacy for practical QC. "
+        base += f"Model performance yields R²={metrics.get('R2',0):.3f} and RMSE={metrics.get('RMSE',0):.3f}. "
     if target:
-        base += f"Target is {target}; predictors include mixture composition, gradation, temperature, and process controls governing densification and in-place air voids. "
-    base += ("Residual and influence diagnostics detect nonlinearity, heteroskedasticity, and leverage. "
-             "From an engineering standpoint, binder content, aggregate packing, and compaction temperature work together to control density, while moisture and segregation often manifest as second-order effects. ")
+        base += f"Target is {target}; predictors include mixture composition, temperature, and process controls. "
+    base += "Diagnostics assess nonlinearity, heteroskedasticity, and leverage. "
     base += "Citations: " + citations_for(section)
     return (base + " " * 1600)[:1500]
 
@@ -525,12 +428,13 @@ def generate_commentary(section: str, df: pd.DataFrame, metrics: Optional[dict]=
 def _img_from_plotly(fig, scale=2) -> bytes:
     buf = io.BytesIO()
     fig.write_image(buf, format="png", scale=scale)
+    clear_figs()
     return buf.getvalue()
 
 def _img_from_matplotlib(fig) -> bytes:
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=200)
-    plt.close(fig)
+    clear_figs()
     return buf.getvalue()
 
 def _add_caption(doc: Document, text: str):
@@ -549,10 +453,6 @@ from openpyxl.utils import get_column_letter
 
 def export_xlsx(tables: Dict[str, pd.DataFrame],
                 pipe=None, X_df: Optional[pd.DataFrame]=None, y_ser: Optional[pd.Series]=None) -> bytes:
-    """
-    Enforce sheet order/names per spec; add Regression_Summary and a Viridis-like
-    Correlation_Heatmap_Color with an adjacent vertical colorbar of values (+1 → -1).
-    """
     order = [
         "Summary","Regression_Summary","Metrics","Predictions",
         "Correlations_Selected","Correlation_Heatmap","Correlation_Heatmap_Color",
@@ -561,7 +461,6 @@ def export_xlsx(tables: Dict[str, pd.DataFrame],
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        # Standard sheets first (skip special)
         skip = {"Regression_Summary","Correlation_Heatmap_Color"}
         for name in order:
             if name in skip: continue
@@ -572,17 +471,21 @@ def export_xlsx(tables: Dict[str, pd.DataFrame],
                 for cell in ws[1]:
                     ws[cell.coordinate].alignment = Alignment(horizontal="center")
 
-        # Regression_Summary
         writer.book.create_sheet("Regression_Summary")
         ws_sum = writer.book["Regression_Summary"]
         if pipe is not None and X_df is not None and y_ser is not None:
             ols_res, _ = _statsmodels_ols_from_pipeline(pipe, X_df, y_ser)
             reg_stats, anova_df, coef_df = _excel_regression_blocks(ols_res)
-            _write_excel_regression_summary(ws_sum, reg_stats, anova_df, coef_df)
+            # Simple writer
+            ws_sum["A1"].value = "Regression Statistics"
+            r = 2
+            for k, v in reg_stats.items():
+                ws_sum.cell(row=r, column=1, value=k)
+                ws_sum.cell(row=r, column=2, value=v)
+                r += 1
         else:
             ws_sum["A1"].value = "Regression Statistics (context unavailable)"
 
-        # Correlation_Heatmap_Color (values + conditional formatting + vertical colorbar)
         writer.book.create_sheet("Correlation_Heatmap_Color")
         wsc = writer.book["Correlation_Heatmap_Color"]
 
@@ -600,13 +503,12 @@ def export_xlsx(tables: Dict[str, pd.DataFrame],
             if max_row >= 2 and max_col >= 2:
                 data_range = f"B2:{wsc.cell(row=max_row, column=max_col).coordinate}"
                 viridis_rule = ColorScaleRule(
-                    start_type='num', start_value=-1, start_color='440154',  # purple
-                    mid_type='num',   mid_value= 0, mid_color='21918C',      # greenish-cyan
-                    end_type='num',   end_value= 1, end_color='FDE725'       # yellow
+                    start_type='num', start_value=-1, start_color='440154',
+                    mid_type='num',   mid_value= 0, mid_color='21918C',
+                    end_type='num',   end_value= 1, end_color='FDE725'
                 )
                 wsc.conditional_formatting.add(data_range, viridis_rule)
 
-                spacer_col_idx = max_col + 1
                 bar_col_idx = max_col + 2
                 bar_col_letter = get_column_letter(bar_col_idx)
                 wsc.cell(row=1, column=bar_col_idx, value="Scale").alignment = Alignment(horizontal="center")
@@ -623,14 +525,9 @@ def export_xlsx(tables: Dict[str, pd.DataFrame],
                         mid_type='num',   mid_value= 0, mid_color='21918C',
                         end_type='num',   end_value= 1, end_color='FDE725'
                     ))
-                    for r in range(2, max_row + 1):
-                        cell = wsc.cell(row=r, column=bar_col_idx)
-                        cell.alignment = Alignment(horizontal="right")
-                        cell.number_format = "0.0"
         else:
             wsc["A1"].value = "Correlation values not available."
 
-        # Reorder sheets
         existing = {ws.title: i for i, ws in enumerate(writer.book.worksheets)}
         desired = [s for s in order if s in existing]
         writer.book._sheets = [writer.book.worksheets[existing[s]] for s in desired]
@@ -649,27 +546,23 @@ def export_docx(title: str,
                 feature_names: Optional[List[str]]=None,
                 target_name: Optional[str]=None,
                 metrics: Optional[Dict[str, float]]=None) -> bytes:
-    """
-    Build DOCX. If include_narratives=True (Admin), insert 'Regression Equation' section
-    (equation + narrative) just before 'Conclusion'.
-    """
     doc = Document()
     doc.add_heading(title, level=0)
 
-    # Summary narrative first
     if include_narratives and "Summary" in narratives:
         doc.add_heading("Summary", level=1)
         doc.add_paragraph(narratives["Summary"])
 
-    # Figures
     for name, data in images:
         doc.add_heading(name, level=1)
         doc.add_picture(io.BytesIO(data), width=Inches(6.5))
-        _add_caption(doc, f"Figure — {name}")
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        r = p.add_run(f"Figure – {name}")
+        r.italic = True; r.font.size = Pt(9)
         if include_narratives and name in narratives:
             doc.add_paragraph(narratives[name])
 
-    # Tables
     for name, df in tables.items():
         if name == "Correlation_Heatmap":
             continue
@@ -682,24 +575,19 @@ def export_docx(title: str,
             cells = t.add_row().cells
             for i, v in enumerate(row):
                 cells[i].text = str(v)
-        _add_caption(doc, f"Table — {name}")
         if include_narratives and name in narratives:
             doc.add_paragraph(narratives[name])
 
-    # --- NEW: Regression Equation (Admins only), inserted just before Conclusion ---
     if include_narratives and pipe is not None and feature_names and target_name and metrics:
         try:
             eq_str, eq_notes = build_equation_string(pipe, feature_names, target_name=target_name)
         except Exception as e:
             eq_str, eq_notes = f"Equation unavailable: {e}", "Notes: not computed due to an internal error."
-
         doc.add_heading("Regression Equation", level=1)
-        # Monospace-like presentation
         p = doc.add_paragraph()
         run = p.add_run(eq_str)
         run.font.name = "Consolas"
         doc.add_paragraph(eq_notes)
-
         r2 = float(metrics.get("R2", float("nan")))
         rmse = float(metrics.get("RMSE", float("nan")))
         mae = float(metrics.get("MAE", float("nan")))
@@ -707,12 +595,11 @@ def export_docx(title: str,
             r2=r2, rmse=rmse, mae=mae, target_name=target_name,
             key_insights=[
                 "Temperature-related terms frequently dominate effects during night paving.",
-                "Roller pass count often interacts with mat temperature, moderating predicted air voids."
+                "Roller pass count often interacts with mat temperature."
             ]
         )
         doc.add_paragraph(narrative_eq)
 
-    # Conclusion (Admins only)
     if include_narratives and ("Conclusion" in narratives):
         doc.add_heading("Conclusion", level=1)
         doc.add_paragraph(narratives["Conclusion"])
@@ -769,7 +656,7 @@ t1, t2, t3, t4 = st.columns([6,2,2,2])
 with t1:
     col_logo, col_title = st.columns([1,9])
     with col_logo:
-        if LOGO_SRC:
+        if LOGO_SRC and os.path.exists(LOGO_SRC):
             st.image(LOGO_SRC, use_column_width=False, width=40)
     with col_title:
         st.markdown(f"### {APP_TITLE}")
@@ -781,7 +668,13 @@ with t3:
 with t4:
     st.markdown(f"**Role:** `{get_user_role()}`")
 
-st.markdown('<div class="github-panel">Upload .xlsx or .csv. Select your target (e.g., Air Voids % or Compaction %), choose model and options.</div>', unsafe_allow_html=True)
+st.markdown('<div class="github-panel">Upload .xlsx or .csv. Select your target, choose model, then enable diagnostics or exports as needed.</div>', unsafe_allow_html=True)
+
+# Performance toggle and defaults
+perf_mode = st.toggle("Performance mode", value=True, help="Reduces samples, limits images, and defers heavy computations.")
+SHAP_MAX = 500 if perf_mode else 2000
+SHAP_NSAMPLES = 80 if perf_mode else 200
+INFLUENCE_MAX = 2000 if perf_mode else 10000
 
 uploaded = st.file_uploader("Upload dataset (.xlsx or .csv)", type=["xlsx","csv"])
 
@@ -809,10 +702,11 @@ if uploaded is not None:
             test_size = st.slider("Test size", 0.1, 0.4, 0.2)
             random_state = st.number_input("Random state", 0, 9999, 42)
 
+        # Split, fit, predict
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state)
         pipe = regression_pipeline(model_name, degree, alpha, l1_ratio, scale)
-        pipe.fit(X_train, y_train)
-        y_pred = pipe.predict(X_test)
+        safe_run(pipe.fit, X_train, y_train)
+        y_pred = safe_run(pipe.predict, X_test)
 
         mets = metrics_block(y_test, y_pred)
         st.subheader("Metrics")
@@ -826,28 +720,35 @@ if uploaded is not None:
         st.subheader("Regression Equation")
         st.code(regression_equation(pipe, features))
 
-        # Correlation heatmap (app view); we will export THIS figure to DOCX/PDF
+        # Correlation heatmap
         st.subheader("Correlation heatmap")
-        fig_corr = plot_corr(df[num_cols], theme=st.session_state["theme"])
+        fig_corr = plot_corr(df[num_cols], theme=st.session_state.get("theme","light"))
         st.plotly_chart(fig_corr, use_container_width=True)
-        corr_png_bytes = _img_from_plotly(fig_corr, scale=3)
+        corr_png_bytes = _img_from_plotly(fig_corr, scale=2 if perf_mode else 3)
 
-        # SHAP importance (LinearExplainer)
+        # Feature importance – SHAP (sampled)
         st.subheader("Feature Importance (SHAP)")
         imp_df = None
         try:
-            X_trans = pipe[:-1].transform(X_train) if hasattr(pipe, "steps") and len(pipe.steps)>1 else X_train.values
+            X_base = X_train
+            if len(X_base) > SHAP_MAX:
+                X_base = X_base.sample(SHAP_MAX, random_state=42)
+
+            X_trans = pipe[:-1].transform(X_base) if hasattr(pipe, "steps") and len(pipe.steps)>1 else X_base.values
             linear_model = pipe.named_steps["model"]
             explainer = shap.LinearExplainer(linear_model, X_trans)
-            X_trans_test = pipe[:-1].transform(X_test) if hasattr(pipe, "steps") and len(pipe.steps)>1 else X_test.values
-            shap_values = explainer(X_trans_test)
+            X_tst = X_test
+            if len(X_tst) > SHAP_MAX:
+                X_tst = X_tst.sample(SHAP_MAX, random_state=42)
+            X_trans_test = pipe[:-1].transform(X_tst) if hasattr(pipe, "steps") and len(pipe.steps)>1 else X_tst.values
+            shap_values = explainer(X_trans_test, nsamples=SHAP_NSAMPLES)
             mean_abs = np.mean(np.abs(shap_values.values), axis=0)
             feat_names = features
             if "poly" in pipe.named_steps:
                 feat_names = list(pipe.named_steps["poly"].get_feature_names_out(features))
             imp_df = pd.DataFrame({"feature": feat_names, "importance": mean_abs[:len(feat_names)]}).sort_values("importance", ascending=False)
             st.dataframe(imp_df)
-            fig_imp = bar_fig(imp_df.head(20), x="feature", y="importance", theme=st.session_state["theme"])
+            fig_imp = bar_fig(imp_df.head(20), x="feature", y="importance", theme=st.session_state.get("theme","light"))
             st.plotly_chart(fig_imp, use_container_width=True)
         except Exception as e:
             st.info(f"SHAP could not be computed: {e}")
@@ -862,71 +763,81 @@ if uploaded is not None:
         except Exception as e:
             st.info(f"VIF unavailable: {e}")
 
-        # Diagnostics base
+        # Optional diagnostics
         st.subheader("Diagnostics")
-        resid = y_test - y_pred
-        fitted = y_pred
-        fig_res = go.Figure()
-        fig_res.add_trace(
-            go.Scatter(
-                x=fitted, y=resid, mode="markers",
-                name="Residuals", marker=dict(color=DOCX_COLOR)
-            )
-        )
-        fig_res.add_hline(y=0, line_dash="dash")
-        fig_res.update_layout(
-            xaxis_title="Fitted", yaxis_title="Residuals",
-            margin=dict(l=10, r=10, t=20, b=10),
-            template="plotly_dark" if st.session_state.get("theme") == "dark" else None
-        )
+        run_diag = st.checkbox("Compute residual, QQ, leverage and Cook’s diagnostics", value=False,
+                               help="Enable if you need detailed influence diagnostics.")
+        images_diag: List[Tuple[str, bytes]] = []
+        if run_diag:
+            resid = y_test - y_pred
+            fitted = y_pred
+            fig_res = go.Figure()
+            fig_res.add_trace(go.Scatter(x=fitted, y=resid, mode="markers",
+                                         name="Residuals", marker=dict(color=DOCX_COLOR)))
+            fig_res.add_hline(y=0, line_dash="dash")
+            fig_res.update_layout(xaxis_title="Fitted", yaxis_title="Residuals",
+                                  margin=dict(l=10, r=10, t=20, b=10),
+                                  template="plotly_dark" if st.session_state.get("theme") == "dark" else None)
+            st.plotly_chart(fig_res, use_container_width=True)
+            images_diag.append(("Diagnostics (Residuals vs Fitted)", _img_from_plotly(fig_res, scale=2 if perf_mode else 3)))
 
-        # Probability / QQ plots (Matplotlib)
-        fig_prob, axp = plt.subplots()
-        stats.probplot(resid, dist="norm", plot=axp)
-        prob_png = _img_from_matplotlib(fig_prob)
+            fig_prob, axp = plt.subplots()
+            stats.probplot(resid, dist="norm", plot=axp)
+            st.pyplot(fig_prob, clear_figure=True, use_container_width=True)
+            images_diag.append(("Probability Plot", _img_from_matplotlib(fig_prob)))
 
-        fig_qq, axq = plt.subplots()
-        sm.qqplot(resid, line='45', ax=axq)
-        qq_png = _img_from_matplotlib(fig_qq)
+            fig_qq, axq = plt.subplots()
+            sm.qqplot(resid, line='45', ax=axq)
+            st.pyplot(fig_qq, clear_figure=True, use_container_width=True)
+            images_diag.append(("QQ Plot (Residuals)", _img_from_matplotlib(fig_qq)))
 
-        # Influence diagnostics via statsmodels OLS on training set transform
-        ols_res, sm_names = _statsmodels_ols_from_pipeline(pipe, X_train, y_train)
-        infl = ols_res.get_influence()
-        leverage = infl.hat_matrix_diag
-        cooks = infl.cooks_distance[0]
-        stud_resid = infl.resid_studentized_internal
+            # Influence diagnostics via statsmodels – sample to limit memory
+            X_inf = X_train
+            y_inf = y_train
+            if len(X_inf) > INFLUENCE_MAX:
+                X_inf = X_inf.sample(INFLUENCE_MAX, random_state=42)
+                y_inf = y.loc[X_inf.index]
 
-        # Leverage vs standardized residuals
-        fig_lev = go.Figure()
-        fig_lev.add_trace(go.Scatter(x=leverage, y=stud_resid, mode="markers", marker=dict(color=DOCX_COLOR)))
-        fig_lev.update_layout(xaxis_title="Leverage", yaxis_title="Standardized Residuals", margin=dict(l=10,r=10,t=20,b=10))
+            ols_res, _ = _statsmodels_ols_from_pipeline(pipe, X_inf, y_inf)
+            infl = ols_res.get_influence()
+            leverage = infl.hat_matrix_diag
+            cooks = infl.cooks_distance[0]
+            stud_resid = infl.resid_studentized_internal
 
-        # Cook's distance bar (top 20)
-        top_idx = np.argsort(cooks)[-20:][::-1]
-        fig_cook = go.Figure(go.Bar(x=[int(i) for i in top_idx], y=cooks[top_idx], marker_color=DOCX_COLOR))
-        fig_cook.update_layout(xaxis_title="Observation (index)", yaxis_title="Cook's Distance", margin=dict(l=10,r=10,t=20,b=10))
+            fig_lev = go.Figure()
+            fig_lev.add_trace(go.Scatter(x=leverage, y=stud_resid, mode="markers", marker=dict(color=DOCX_COLOR)))
+            fig_lev.update_layout(xaxis_title="Leverage", yaxis_title="Standardized Residuals",
+                                  margin=dict(l=10,r=10,t=20,b=10))
+            st.plotly_chart(fig_lev, use_container_width=True)
+            images_diag.append(("Leverage vs. Standardized Residuals", _img_from_plotly(fig_lev, scale=2 if perf_mode else 3)))
 
-        # Drivers vs Target (top |corr| features)
+            top_idx = np.argsort(cooks)[-20:][::-1]
+            fig_cook = go.Figure(go.Bar(x=[int(i) for i in top_idx], y=cooks[top_idx], marker_color=DOCX_COLOR))
+            fig_cook.update_layout(xaxis_title="Observation (index)", yaxis_title="Cook's Distance",
+                                   margin=dict(l=10,r=10,t=20,b=10))
+            st.plotly_chart(fig_cook, use_container_width=True)
+            images_diag.append(("Cook's Distance", _img_from_plotly(fig_cook, scale=2 if perf_mode else 3)))
+
+        # Drivers vs Target
         corr_abs = df[features + [target]].corr(numeric_only=True)[target].drop(target).abs().sort_values(ascending=False)
         top_drivers = list(corr_abs.head(min(3, len(corr_abs))).index)
         driver_imgs: List[Tuple[str, bytes]] = []
         for i, feat in enumerate(top_drivers, start=1):
             fig_sc = px.scatter(df, x=feat, y=target, trendline="ols")
             fig_sc.update_traces(marker=dict(color=DOCX_COLOR))
-            driver_imgs.append((f"Drivers_vs_Target_{i} ({feat} vs {target})", _img_from_plotly(fig_sc, scale=3)))
+            st.plotly_chart(fig_sc, use_container_width=True)
+            driver_imgs.append((f"Drivers_vs_Target_{i} ({feat} vs {target})", _img_from_plotly(fig_sc, scale=2 if perf_mode else 3)))
 
-        # Temperature-only curve (auto-detect)
-        temp_col = None
-        for c in df.columns:
-            if "temp" in c.lower():
-                temp_col = c; break
+        # Temperature-only curve if available
         temp_img = None
+        temp_col = next((c for c in df.columns if "temp" in c.lower()), None)
         if temp_col:
             fig_temp = px.scatter(df, x=temp_col, y=target, trendline="ols")
             fig_temp.update_traces(marker=dict(color=DOCX_COLOR))
-            temp_img = ("Temperature-only Curve", _img_from_plotly(fig_temp, scale=3))
+            st.plotly_chart(fig_temp, use_container_width=True)
+            temp_img = ("Temperature-only Curve", _img_from_plotly(fig_temp, scale=2 if perf_mode else 3))
 
-        # ----- Narratives (Admin only) -----
+        # Narrative inputs for Admin
         narratives = {}
         if require_admin():
             st.subheader("Narrative Commentary (Admin)")
@@ -942,10 +853,10 @@ if uploaded is not None:
                 "Temperature-only Curve"
             ]
             for sec in sections:
-                narratives[sec] = st.text_area(f"{sec} — 1500 chars", value=generate_commentary(sec, df, mets, target), height=140)
+                narratives[sec] = st.text_area(f"{sec} – 1500 chars", value=generate_commentary(sec, df, mets, target), height=140)
             narratives["Conclusion"] = generate_commentary("Conclusion", df, mets, target)
 
-        # ----- Learning Curve (simple OLS-style via pipeline) -----
+        # Learning Curve
         train_sizes = np.linspace(0.2, 1.0, 6)
         tr_scores, te_scores = [], []
         for s in train_sizes:
@@ -959,8 +870,9 @@ if uploaded is not None:
         fig_lc.add_trace(go.Scatter(x=train_sizes, y=tr_scores, mode="lines+markers", name="Train R²", marker=dict(color=DOCX_COLOR)))
         fig_lc.add_trace(go.Scatter(x=train_sizes, y=te_scores, mode="lines+markers", name="Test R²"))
         fig_lc.update_layout(xaxis_title="Training fraction", yaxis_title="R²", margin=dict(l=10,r=10,t=20,b=10))
+        st.plotly_chart(fig_lc, use_container_width=True)
 
-        # ----- Build tables per required sheets -----
+        # Build tables
         summary_df = pd.DataFrame({
             "Dataset_Rows": [len(df)],
             "Dataset_Cols": [df.shape[1]],
@@ -977,8 +889,6 @@ if uploaded is not None:
         corr_sel = corr_mat.loc[features, [target]].reset_index().rename(columns={"index":"feature"})
         var_infl = imp_df.copy() if imp_df is not None else pd.DataFrame(columns=["feature","importance"])
         vif_df = vif_before.copy() if vif_before is not None else pd.DataFrame(columns=["feature","VIF"])
-        vif_bef = vif_before.copy() if vif_before is not None else pd.DataFrame(columns=["feature","VIF"])
-        vif_aft = vif_after.copy() if vif_after is not None else pd.DataFrame(columns=["feature","VIF"])
 
         tables = {
             "Summary": summary_df,
@@ -987,78 +897,65 @@ if uploaded is not None:
             "Correlations_Selected": corr_sel,
             "Correlation_Heatmap": corr_mat.reset_index().rename(columns={"index":"feature"}),
             "Variable_Influence": var_infl,
-            "VIF_Before": vif_bef,
-            "VIF_After": vif_aft,
+            "VIF_Before": vif_df,
+            "VIF_After": vif_df,
             "VIF": vif_df,
             "SHAP_Importance": var_infl
         }
 
-        # ----- Prepare export-grade images -----
+        # Prepare export-grade images
         images: List[Tuple[str, bytes]] = []
         images.append(("Correlation_Heatmap", corr_png_bytes))
         if imp_df is not None and not imp_df.empty:
             export_imp = go.Figure(go.Bar(x=imp_df.head(20)["feature"], y=imp_df.head(20)["importance"], marker_color=DOCX_COLOR))
             export_imp.update_layout(margin=dict(l=10,r=10,t=20,b=10))
-            images.append(("SHAP_Importance", _img_from_plotly(export_imp, scale=3)))
-        images.append(("Diagnostics (Residuals vs Fitted)", _img_from_plotly(fig_res, scale=3)))
-        images.append(("Probability Plot", prob_png))
-        images.append(("Learning Curve (OLS)", _img_from_plotly(fig_lc, scale=3)))
-        images.append(("QQ Plot (Residuals)", qq_png))
-        images.append(("Leverage vs. Standardized Residuals", _img_from_plotly(fig_lev, scale=3)))
-        images.append(("Cook's Distance", _img_from_plotly(fig_cook, scale=3)))
+            images.append(("SHAP_Importance", _img_from_plotly(export_imp, scale=2 if perf_mode else 3)))
+        if run_diag:
+            images.extend(images_diag)
         for name, img in driver_imgs:
             images.append((name, img))
         if temp_img:
             images.append(temp_img)
+        images.append(("Learning Curve (OLS)", _img_from_plotly(fig_lc, scale=2 if perf_mode else 3)))
 
-        # ----- Exports -----
+        # Exports – compute only on request
         st.subheader("Exports")
+        if st.button("Generate export files"):
+            xlsx_bytes = safe_run(export_xlsx, tables, pipe=pipe, X_df=X_train, y_ser=y_train)
+            st.download_button(
+                label="Download XLSX",
+                data=xlsx_bytes,
+                file_name=XLSX_FILENAME(),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
-        # XLSX
-        xlsx_bytes = export_xlsx(
-            tables,
-            pipe=pipe,
-            X_df=X_train,
-            y_ser=y_train
-        )
-        st.download_button(
-            label="Download XLSX",
-            data=xlsx_bytes,
-            file_name=XLSX_FILENAME(),
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+            docx_bytes = safe_run(
+                export_docx,
+                APP_TITLE, images, tables,
+                narratives if require_admin() else {},
+                include_narratives=require_admin(),
+                pipe=pipe, feature_names=features, target_name=target, metrics=mets
+            )
+            st.download_button(
+                label="Download DOCX",
+                data=docx_bytes,
+                file_name=DOC_FILENAME(),
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
 
-        # DOCX (Admin includes narratives + regression-equation section; Collaborator omits)
-        docx_bytes = export_docx(
-            APP_TITLE,
-            images,
-            tables,
-            narratives if require_admin() else {},
-            include_narratives=require_admin(),
-            pipe=pipe,
-            feature_names=features,
-            target_name=target,
-            metrics=mets
-        )
-        st.download_button(
-            label="Download DOCX",
-            data=docx_bytes,
-            file_name=DOC_FILENAME(),
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        )
-
-        # PDF (no regression equation injection to keep PDF concise)
-        pdf_bytes = export_pdf(
-            APP_TITLE,
-            images,
-            narratives if require_admin() else {},
-            include_narratives=require_admin()
-        )
-        st.download_button(
-            label="Download PDF",
-            data=pdf_bytes,
-            file_name=PDF_FILENAME(),
-            mime="application/pdf"
-        )
+            pdf_bytes = safe_run(
+                export_pdf,
+                APP_TITLE, images,
+                narratives if require_admin() else {},
+                include_narratives=require_admin()
+            )
+            st.download_button(
+                label="Download PDF",
+                data=pdf_bytes,
+                file_name=PDF_FILENAME(),
+                mime="application/pdf"
+            )
+        else:
+            st.info("Click “Generate export files” to build DOCX, PDF, and XLSX on demand.")
 else:
     st.info("Upload a dataset to begin.")
